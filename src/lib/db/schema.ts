@@ -38,6 +38,7 @@ export type ResponseRow = {
   status: ResponseStatus;
   public_note: string;
   submitted_at: string;
+  device_id?: string | null;
 };
 
 /**
@@ -68,6 +69,7 @@ export type Database = {
           status?: ResponseStatus;
           public_note?: string;
           submitted_at?: string;
+          device_id?: string | null;
         };
         Update: Partial<Pick<ResponseRow, 'status' | 'public_note'>>;
         Relationships: [];

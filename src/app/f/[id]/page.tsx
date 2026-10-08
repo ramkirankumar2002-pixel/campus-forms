@@ -9,7 +9,6 @@ import {
   Clock,
   FileQuestion,
   CheckCircle2,
-  RotateCcw,
   Send,
   Timer,
   Users,
@@ -25,6 +24,7 @@ import { addResponse, newResponseRef, uploadResponsePhoto } from '@/lib/db/forms
 import { useToast } from '@/components/ui/toast';
 import { validateFill, type RespondentInput } from '@/lib/validation';
 import { hasSubmitted, markSubmitted } from '@/lib/submissions';
+import { getOrCreateDeviceId } from '@/lib/device';
 import { clearDraft, loadDraft, saveDraft } from '@/lib/drafts';
 import { CATEGORIES, CATEGORY_ACCENT } from '@/lib/constants';
 import { DEMO_FORM_ID, demoForm, isDemoFormId } from '@/lib/demo';
@@ -98,7 +98,6 @@ export default function FillFormPage() {
   const [respondent, setRespondent] = useState<RespondentInput>({ name: '', email: '' });
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submittedId, setSubmittedId] = useState<string | null>(null);
-  const [fillAgain, setFillAgain] = useState(false);
   const [draftRestored, setDraftRestored] = useState<string | null>(null);
   // localStorage isn't readable during SSR, so this is a client-only lookup.
   const alreadySubmitted = useSyncExternalStore(
@@ -247,12 +246,14 @@ export default function FillFormPage() {
         answers[q.id] = path;
       }
 
+      const deviceId = getOrCreateDeviceId();
       await addResponse(db, {
         formId: form.id,
         respondentName: form.anonymous ? null : respondent.name.trim(),
         respondentEmail: form.anonymous ? null : respondent.email.trim() || null,
         answers,
         ref,
+        deviceId,
       });
       // Only mark it locally once the write actually landed — otherwise a
       // failed submit would lock this browser out of retrying.
@@ -347,20 +348,6 @@ export default function FillFormPage() {
                   />
                 </>
               )}
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setValues({});
-                  setRespondent({ name: '', email: '' });
-                  setPendingFiles({});
-                  setErrors({});
-                  setSubmittedId(null);
-                  setFillAgain(true);
-                }}
-              >
-                <RotateCcw />
-                Submit another response
-              </Button>
               <Link href="/browse" className={buttonVariants()}>
                 Browse more forms
               </Link>
@@ -385,7 +372,7 @@ export default function FillFormPage() {
     );
   }
 
-  if (alreadySubmitted && !fillAgain) {
+  if (alreadySubmitted) {
     return (
       <div className="flex min-h-svh flex-col">
         <SiteHeader />
@@ -398,14 +385,9 @@ export default function FillFormPage() {
               You’ve already responded
             </h1>
             <p className="mt-2 max-w-sm text-sm leading-relaxed text-ink/60">
-              This browser submitted “{form.title}” once already. Fill it in
-              again only if the organizer asked you to.
+              This device has already submitted a response for “{form.title}”. Multiple submissions from the same device are not permitted.
             </p>
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-              <Button variant="secondary" onClick={() => setFillAgain(true)}>
-                <RotateCcw />
-                Fill it in again
-              </Button>
               <Link href="/browse" className={buttonVariants()}>
                 Browse open forms
               </Link>

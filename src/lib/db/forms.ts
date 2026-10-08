@@ -268,6 +268,7 @@ export async function addResponse(
     respondentName: string | null;
     respondentEmail: string | null;
     answers: Record<string, AnswerValue>;
+    deviceId?: string | null;
     /** When photos were uploaded first, this is the ref those paths used. */
     ref?: string;
   }
@@ -280,6 +281,7 @@ export async function addResponse(
       respondent_name: input.respondentName,
       respondent_email: input.respondentEmail,
       answers: input.answers,
+      device_id: input.deviceId ?? null,
     });
     return error;
   };
@@ -287,13 +289,20 @@ export async function addResponse(
   const first = input.ref ?? newResponseRef();
   const error = await write(first);
   if (!error) return first;
-  // Unique `ref` collision is vanishingly rare; retry once, then surface.
-  // Don't retry when the caller already bound photos to `ref`.
-  if (error.code === '23505' && !input.ref) {
-    const retry = newResponseRef();
-    const again = await write(retry);
-    if (!again) return retry;
-    throw new Error(again.message);
+
+  if (error.code === '23505') {
+    // Check if the unique constraint violation was from device duplication
+    if (error.message?.includes('device') || error.details?.includes('device_id')) {
+      throw new Error('You have already submitted a response to this form from this device.');
+    }
+    // Unique `ref` collision is vanishingly rare; retry once, then surface.
+    // Don't retry when the caller already bound photos to `ref`.
+    if (!input.ref) {
+      const retry = newResponseRef();
+      const again = await write(retry);
+      if (!again) return retry;
+      throw new Error(again.message);
+    }
   }
   throw new Error(error.message);
 }
