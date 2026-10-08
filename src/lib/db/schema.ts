@@ -1,0 +1,181 @@
+import type {
+  AnswerValue,
+  FormCategory,
+  FormDefinition,
+  FormResponse,
+  FormStatus,
+  Question,
+  ResponseStatus,
+} from '@/lib/types';
+
+/** A row of `forms` exactly as Postgres stores it. */
+// Type aliases, not interfaces: only an alias gets the implicit index
+// signature that supabase-js's generics require of a row type.
+export type FormRow = {
+  id: string;
+  owner_id: string;
+  title: string;
+  description: string;
+  category: FormCategory;
+  status: FormStatus;
+  anonymous: boolean;
+  deadline: string | null;
+  questions: Question[];
+  pinned: boolean;
+  max_responses: number | null;
+  response_count: number;
+  created_at: string;
+};
+
+/** A row of `responses`. */
+export type ResponseRow = {
+  id: string;
+  form_id: string;
+  ref: string;
+  respondent_name: string | null;
+  respondent_email: string | null;
+  answers: Record<string, AnswerValue>;
+  status: ResponseStatus;
+  public_note: string;
+  submitted_at: string;
+};
+
+/**
+ * Hand-written rather than generated, so the table shapes stay reviewable in
+ * the same place as the migration. Regenerate with the Supabase CLI later if
+ * the schema grows past what's comfortable to maintain by hand.
+ */
+export type Database = {
+  public: {
+    Tables: {
+      forms: {
+        Row: FormRow;
+        Insert: Omit<
+          FormRow,
+          'id' | 'created_at' | 'response_count' | 'pinned' | 'max_responses'
+        > & {
+          id?: string;
+          response_count?: number;
+          pinned?: boolean;
+          max_responses?: number | null;
+        };
+        Update: Partial<Omit<FormRow, 'id' | 'owner_id' | 'created_at' | 'response_count'>>;
+        Relationships: [];
+      };
+      responses: {
+        Row: ResponseRow;
+        Insert: Omit<ResponseRow, 'submitted_at' | 'status' | 'public_note'> & {
+          status?: ResponseStatus;
+          public_note?: string;
+          submitted_at?: string;
+        };
+        Update: Partial<Pick<ResponseRow, 'status' | 'public_note'>>;
+        Relationships: [];
+      };
+      organizer_requests: {
+        Row: {
+          id: string;
+          email: string;
+          note: string;
+          created_at: string;
+        };
+        Insert: {
+          email: string;
+          note?: string;
+        };
+        Update: Record<string, never>;
+        Relationships: [];
+      };
+    };
+    Views: Record<never, never>;
+    Functions: {
+      lookup_response_by_ref: {
+        Args: { p_ref: string };
+        Returns: {
+          form_title: string;
+          form_category: FormCategory;
+          response_status: ResponseStatus;
+          submitted_at: string;
+          is_anonymous: boolean;
+          public_note: string;
+        }[];
+      };
+    };
+    Enums: {
+      form_category: FormCategory;
+      form_status: FormStatus;
+      response_status: ResponseStatus;
+    };
+    CompositeTypes: Record<never, never>;
+  };
+};
+
+/**
+ * The UI speaks camelCase `FormDefinition`; the database speaks snake_case
+ * rows. These two functions are the only place that difference exists.
+ */
+export function toForm(row: FormRow): FormDefinition {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    category: row.category,
+    status: row.status,
+    anonymous: row.anonymous,
+    deadline: row.deadline,
+    questions: row.questions,
+    pinned: row.pinned,
+    maxResponses: row.max_responses,
+    createdAt: row.created_at,
+  };
+}
+
+/** A form plus its response count — what every list view needs. */
+export type FormSummary = FormDefinition & { responseCount: number };
+
+export function toSummary(row: FormRow): FormSummary {
+  return { ...toForm(row), responseCount: row.response_count };
+}
+
+export function toDefinition(summary: FormSummary): FormDefinition {
+  const {
+    id,
+    title,
+    description,
+    category,
+    status,
+    anonymous,
+    deadline,
+    questions,
+    pinned,
+    maxResponses,
+    createdAt,
+  } = summary;
+  return {
+    id,
+    title,
+    description,
+    category,
+    status,
+    anonymous,
+    deadline,
+    questions,
+    pinned,
+    maxResponses,
+    createdAt,
+  };
+}
+
+export function toResponse(row: ResponseRow): FormResponse {
+  return {
+    id: row.id,
+    formId: row.form_id,
+    ref: row.ref,
+    respondentName: row.respondent_name,
+    respondentEmail: row.respondent_email,
+    submittedAt: row.submitted_at,
+    answers: row.answers,
+    status: row.status,
+    publicNote: row.public_note,
+  };
+}

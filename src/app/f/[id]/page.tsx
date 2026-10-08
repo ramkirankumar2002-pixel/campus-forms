@@ -1,0 +1,632 @@
+'use client';
+
+import { useState, useEffect, useSyncExternalStore } from 'react';
+import Link from 'next/link';
+import { useParams } from 'next/navigation';
+import {
+  ArrowLeft,
+  CalendarDays,
+  Clock,
+  FileQuestion,
+  CheckCircle2,
+  RotateCcw,
+  Send,
+  Timer,
+  Users,
+} from 'lucide-react';
+import { SiteHeader } from '@/components/site-header';
+import { SiteFooter } from '@/components/site-footer';
+import { FormRenderer } from '@/components/form-renderer';
+import { Button, buttonVariants } from '@/components/ui/button';
+import { CopyLinkButton, WhatsAppShareButton } from '@/components/copy-link-button';
+import { SetupRequired } from '@/components/setup-required';
+import { usePublicForm } from '@/lib/db/hooks';
+import { addResponse, newResponseRef, uploadResponsePhoto } from '@/lib/db/forms';
+import { useToast } from '@/components/ui/toast';
+import { validateFill, type RespondentInput } from '@/lib/validation';
+import { hasSubmitted, markSubmitted } from '@/lib/submissions';
+import { clearDraft, loadDraft, saveDraft } from '@/lib/drafts';
+import { CATEGORIES, CATEGORY_ACCENT } from '@/lib/constants';
+import { DEMO_FORM_ID, demoForm, isDemoFormId } from '@/lib/demo';
+import { preparePhoto, responseFilePath } from '@/lib/photos';
+import {
+  cn,
+  deadlineInfo,
+  estimateFillMinutes,
+  isFormAccepting,
+  pluralize,
+  spotsLeft,
+  timeAgo,
+} from '@/lib/utils';
+import type { AnswerValue } from '@/lib/types';
+
+function PageSkeleton() {
+  return (
+    <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-10" aria-hidden>
+      <div className="skeleton h-4 w-28 rounded" />
+      <div className="skeleton mt-6 h-64 rounded-3xl" />
+    </main>
+  );
+}
+
+/* Scatter vectors for the success confetti, one entry per particle. */
+const CONFETTI = [
+  { c: 'bg-ballpoint-500', tx: '-72px', ty: '-44px', rot: '-160deg' },
+  { c: 'bg-amber-400', tx: '58px', ty: '-58px', rot: '140deg' },
+  { c: 'bg-tick', tx: '84px', ty: '-10px', rot: '200deg' },
+  { c: 'bg-marker-strong', tx: '-88px', ty: '-16px', rot: '-210deg' },
+  { c: 'bg-violet-400', tx: '-42px', ty: '52px', rot: '150deg' },
+  { c: 'bg-emerald-400', tx: '48px', ty: '56px', rot: '-130deg' },
+  { c: 'bg-ballpoint-300', tx: '10px', ty: '-86px', rot: '90deg' },
+  { c: 'bg-rose-400', tx: '-10px', ty: '80px', rot: '-90deg' },
+] as const;
+
+function ClosedPanel({ reason }: { reason: string }) {
+  return (
+    <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-10">
+      <div className="grid place-items-center rounded-3xl border border-ink/10 bg-card px-6 py-16 text-center shadow-sm">
+        <span className="grid size-14 place-items-center rounded-2xl bg-ink/[0.05]">
+          <Clock className="size-7 text-ink/40" aria-hidden />
+        </span>
+        <h1 className="mt-5 font-display text-2xl font-bold tracking-tight">
+          This form isn’t accepting responses
+        </h1>
+        <p className="mt-2 max-w-sm text-sm leading-relaxed text-ink/60">{reason}</p>
+        <Link
+          href="/browse"
+          className={buttonVariants({ variant: 'secondary', className: 'mt-6' })}
+        >
+          <ArrowLeft />
+          Browse open forms
+        </Link>
+      </div>
+    </main>
+  );
+}
+
+export default function FillFormPage() {
+  const params = useParams<{ id: string }>();
+  const toast = useToast();
+  const isDemo = isDemoFormId(params.id);
+  const publicForm = usePublicForm(isDemo ? undefined : params.id);
+  const { db, error, configured, loading } = publicForm;
+  const form = isDemo ? demoForm() : publicForm.form ?? null;
+  const [submitting, setSubmitting] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<Record<string, File>>({});
+
+  const [values, setValues] = useState<Record<string, AnswerValue>>({});
+  const [respondent, setRespondent] = useState<RespondentInput>({ name: '', email: '' });
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [submittedId, setSubmittedId] = useState<string | null>(null);
+  const [fillAgain, setFillAgain] = useState(false);
+  const [draftRestored, setDraftRestored] = useState<string | null>(null);
+  // localStorage isn't readable during SSR, so this is a client-only lookup.
+  const alreadySubmitted = useSyncExternalStore(
+    () => () => {},
+    () => (params.id ? hasSubmitted(params.id) : false),
+    () => false
+  );
+
+  const formId = form?.id ?? null;
+
+  // Restore the autosaved draft once per form — a refresh mid-complaint
+  // shouldn't cost the student their typing.
+  useEffect(() => {
+    if (!formId) return;
+    const draft = loadDraft(formId);
+    if (draft && Object.keys(draft.values).length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot rehydration from localStorage, the same seed the builder does.
+      setValues(draft.values);
+      setRespondent(draft.respondent);
+      setDraftRestored(draft.savedAt);
+    }
+  }, [formId]);
+
+  // Autosave (debounced) as they type; wiped the moment a submit lands.
+  // Photos don't survive a refresh — File can't go in localStorage.
+  useEffect(() => {
+    if (!formId || submittedId || !form) return;
+    const persistable = Object.fromEntries(
+      Object.entries(values).filter(([id]) => form.questions.find((q) => q.id === id)?.type !== 'file')
+    );
+    const t = setTimeout(() => saveDraft(formId, { values: persistable, respondent }), 500);
+    return () => clearTimeout(t);
+  }, [formId, form, values, respondent, submittedId]);
+
+  if (!configured && !isDemo) return <SetupRequired variant="public" />;
+
+  if (loading && !isDemo) {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <PageSkeleton />
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  if (!form) {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-10">
+          <div className="grid place-items-center rounded-3xl border border-ink/10 bg-card px-6 py-16 text-center shadow-sm">
+            <span className="grid size-14 place-items-center rounded-2xl bg-ink/[0.05]">
+              <FileQuestion className="size-7 text-ink/40" aria-hidden />
+            </span>
+            <h1 className="mt-5 font-display text-2xl font-bold tracking-tight">
+              {error ? 'Couldn’t load this form' : 'Form not found'}
+            </h1>
+            <p className="mt-2 max-w-sm text-sm leading-relaxed text-ink/60">
+              {error ??
+                'This form doesn’t exist anymore, or the link was mistyped. Check the notice board for what’s open.'}
+            </p>
+            <Link
+              href="/browse"
+              className={buttonVariants({ variant: 'secondary', className: 'mt-6' })}
+            >
+              <ArrowLeft />
+              Browse open forms
+            </Link>
+          </div>
+        </main>
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  const dl = deadlineInfo(form.deadline);
+
+  if (form.status === 'draft') {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <ClosedPanel
+          reason="The organizer hasn’t published this form yet. Check back once it’s announced."
+        />
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  const full = !isDemo && !isFormAccepting(form) && form.status === 'open' && !dl.expired;
+
+  if (!isDemo && (form.status === 'closed' || dl.expired || full)) {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <ClosedPanel
+          reason={
+            form.status === 'closed'
+              ? 'The organizer closed this form. It may reopen — keep an eye on the notice board.'
+              : dl.expired
+                ? `The deadline passed on ${dl.label?.replace('Deadline passed ', '')}. Late responses aren’t accepted.`
+                : 'This form is full — the organizer set a cap and it’s been reached.'
+          }
+        />
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  const handleSubmit = async () => {
+    if (submitting) return;
+    const errs = validateFill(form, values, respondent, pendingFiles);
+    setErrors(errs);
+    if (Object.keys(errs).length > 0) {
+      requestAnimationFrame(() => {
+        document
+          .querySelector('[data-error="true"]')
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (isDemo) {
+        markSubmitted(DEMO_FORM_ID);
+        clearDraft(DEMO_FORM_ID);
+        setDraftRestored(null);
+        setSubmittedId('demo');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+
+      const ref = newResponseRef();
+      const answers: Record<string, AnswerValue> = { ...values };
+      for (const q of form.questions) {
+        if (q.type !== 'file') continue;
+        const file = pendingFiles[q.id];
+        if (!file) {
+          delete answers[q.id];
+          continue;
+        }
+        const blob = await preparePhoto(file);
+        const path = responseFilePath(form.id, ref, q.id);
+        await uploadResponsePhoto(db, path, blob);
+        answers[q.id] = path;
+      }
+
+      await addResponse(db, {
+        formId: form.id,
+        respondentName: form.anonymous ? null : respondent.name.trim(),
+        respondentEmail: form.anonymous ? null : respondent.email.trim() || null,
+        answers,
+        ref,
+      });
+      // Only mark it locally once the write actually landed — otherwise a
+      // failed submit would lock this browser out of retrying.
+      markSubmitted(form.id);
+      clearDraft(form.id);
+      setDraftRestored(null);
+      setSubmittedId(ref);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'That didn’t send. Try again.', 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (submittedId) {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-14">
+          <div className="rounded-3xl border border-ink/10 bg-card px-6 py-14 text-center shadow-sm sm:px-12">
+            <div className="relative mx-auto size-20">
+              <svg viewBox="0 0 100 100" className="size-20 text-tick" role="img" aria-label="Submitted">
+                <circle
+                  cx="50"
+                  cy="50"
+                  r="46"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  className="draw-ring"
+                  transform="rotate(-90 50 50)"
+                />
+                <path
+                  d="M31 52 L45 65 L70 38"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="draw-check"
+                />
+              </svg>
+              <div aria-hidden className="pointer-events-none absolute inset-0">
+                {CONFETTI.map((p, i) => (
+                  <span
+                    key={i}
+                    className={cn('confetti-particle absolute left-1/2 top-1/2 size-2 rounded-[2px]', p.c)}
+                    style={
+                      {
+                        '--tx': p.tx,
+                        '--ty': p.ty,
+                        '--rot': p.rot,
+                      } as React.CSSProperties
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+            <div className="animate-stamp mx-auto mt-5 inline-block rounded-lg border-[3px] border-tick px-4 py-1">
+              <p className="font-mono text-xs font-bold uppercase tracking-[0.22em] text-tick">
+                Received
+              </p>
+            </div>
+            <h1 className="mt-5 font-display text-3xl font-extrabold tracking-tight">
+              Response submitted
+            </h1>
+            <p className="mt-3 text-sm leading-relaxed text-ink/60">
+              {isDemo
+                ? 'That’s how a real submission feels. This sample stayed on your device — a hostel office never sees it.'
+                : form.anonymous
+                  ? 'Thanks — this response is anonymous. Your name and email weren’t collected.'
+                  : `Thanks, ${respondent.name.trim().split(/\s+/)[0]} — the organizer can see your name on this one.`}
+            </p>
+            {isDemo ? null : (
+              <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-ink/40">
+                REF #{submittedId.toUpperCase()} · {form.title}
+              </p>
+            )}
+            <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
+              {isDemo ? null : (
+                <>
+                  <CopyLinkButton
+                    link={submittedId.toUpperCase()}
+                    label="Copy REF"
+                    copiedToast="REF copied — keep it to track this response"
+                  />
+                  <WhatsAppShareButton
+                    title={form.title}
+                    url={`${window.location.origin}/f/${form.id}`}
+                  />
+                </>
+              )}
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setValues({});
+                  setRespondent({ name: '', email: '' });
+                  setPendingFiles({});
+                  setErrors({});
+                  setSubmittedId(null);
+                  setFillAgain(true);
+                }}
+              >
+                <RotateCcw />
+                Submit another response
+              </Button>
+              <Link href="/browse" className={buttonVariants()}>
+                Browse more forms
+              </Link>
+              {isDemo ? null : (
+                <Link
+                  href={`/status?ref=${submittedId.toUpperCase()}`}
+                  className={buttonVariants({ variant: 'ghost' })}
+                >
+                  Track this response
+                </Link>
+              )}
+            </div>
+            {isDemo ? null : (
+              <p className="mt-4 font-mono text-[11px] uppercase tracking-wider text-ink/40">
+                Save your REF code — it’s how you check back on this response.
+              </p>
+            )}
+          </div>
+        </main>
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  if (alreadySubmitted && !fillAgain) {
+    return (
+      <div className="flex min-h-svh flex-col">
+        <SiteHeader />
+        <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-10">
+          <div className="grid place-items-center rounded-3xl border border-ink/10 bg-card px-6 py-16 text-center shadow-sm">
+            <span className="grid size-14 place-items-center rounded-2xl bg-tick-soft">
+              <CheckCircle2 className="size-7 text-tick" aria-hidden />
+            </span>
+            <h1 className="mt-5 font-display text-2xl font-bold tracking-tight">
+              You’ve already responded
+            </h1>
+            <p className="mt-2 max-w-sm text-sm leading-relaxed text-ink/60">
+              This browser submitted “{form.title}” once already. Fill it in
+              again only if the organizer asked you to.
+            </p>
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              <Button variant="secondary" onClick={() => setFillAgain(true)}>
+                <RotateCcw />
+                Fill it in again
+              </Button>
+              <Link href="/browse" className={buttonVariants()}>
+                Browse open forms
+              </Link>
+            </div>
+          </div>
+        </main>
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-svh flex-col">
+      <SiteHeader />
+
+      <main className="mx-auto w-full max-w-2xl flex-1 px-4 py-10 sm:py-12">
+        <Link
+          href="/browse"
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-ink/50 transition hover:text-ink"
+        >
+          <ArrowLeft className="size-4" aria-hidden />
+          All open forms
+        </Link>
+
+        <div className="mt-4 overflow-hidden rounded-3xl border border-ink/10 bg-card shadow-sm">
+          {/* Category band — tints the form by what it's for */}
+          <div
+            className={cn('flex items-center gap-2 px-6 py-3.5 sm:px-8', CATEGORY_ACCENT[form.category].band)}
+          >
+            {(() => {
+              const Icon = CATEGORIES[form.category].icon;
+              return <Icon className="size-4" aria-hidden />;
+            })()}
+            <span className="text-[13px] font-semibold">
+              {CATEGORIES[form.category].label} form
+            </span>
+            <span className="ml-auto flex items-center gap-1.5">
+              {isDemo ? (
+                <span className="inline-flex items-center rounded-full bg-card/70 px-2.5 py-0.5 text-xs font-medium">
+                  Sample
+                </span>
+              ) : null}
+              {form.anonymous ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-card/70 px-2.5 py-0.5 text-xs font-medium">
+                  Anonymous
+                </span>
+              ) : null}
+            </span>
+          </div>
+
+          <div className="p-6 sm:p-8">
+            <h1 className="font-display text-[28px] font-extrabold leading-tight tracking-tight">
+              {form.title}
+            </h1>
+            {form.description ? (
+              <p className="mt-2.5 text-[15px] leading-relaxed text-ink/60">{form.description}</p>
+            ) : null}
+            {isDemo ? (
+              <p className="mt-4 rounded-xl border border-ballpoint-200 bg-ballpoint-50 px-4 py-3 text-sm leading-relaxed text-ballpoint-900">
+                This is a sample. Submitting it doesn’t go to a hostel office —
+                try it to see how a real form feels.
+              </p>
+            ) : null}
+            <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-ink/[0.06] pb-4 font-mono text-[11px] text-ink/50">
+              {isDemo ? null : (
+                <span className="inline-flex items-center gap-1.5">
+                  <Users className="size-3.5" aria-hidden />
+                  {spotsLeft(form) == null
+                    ? `${pluralize(form.responseCount, 'response')} so far`
+                    : `${spotsLeft(form)} ${spotsLeft(form) === 1 ? 'spot' : 'spots'} left`}
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1.5">
+                <Timer className="size-3.5" aria-hidden />
+                ~{estimateFillMinutes(form.questions)} min to fill
+              </span>
+              {dl.label ? (
+                <span
+                  className={`inline-flex items-center gap-1.5 ${
+                    dl.label.startsWith('Closes today')
+                      ? 'font-semibold text-warn-tx'
+                      : ''
+                  }`}
+                >
+                  <CalendarDays className="size-3.5" aria-hidden />
+                  {dl.label}
+                </span>
+              ) : null}
+            </div>
+
+            {draftRestored ? (
+              <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-ballpoint-200 bg-ballpoint-50 px-3.5 py-2.5 text-[13px] text-ballpoint-900">
+                <span>
+                  Draft restored <span className="text-ballpoint-700">· saved {timeAgo(draftRestored)}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearDraft(form.id);
+                    setValues({});
+                    setRespondent({ name: '', email: '' });
+                    setDraftRestored(null);
+                  }}
+                  className="ml-auto font-medium text-ballpoint-800 underline decoration-ballpoint-300 underline-offset-2 transition hover:text-ballpoint-600 outline-none focus-visible:ring-2 focus-visible:ring-ballpoint-500/40 rounded"
+                >
+                  Discard
+                </button>
+              </div>
+            ) : null}
+
+            {(() => {
+              const required = form.questions.filter((q) => q.required);
+              const answeredRequired = required.filter((q) => {
+                if (q.type === 'file') return Boolean(pendingFiles[q.id]);
+                const v = values[q.id];
+                return !(
+                  v === undefined ||
+                  v === null ||
+                  v === '' ||
+                  (Array.isArray(v) && v.length === 0)
+                );
+              }).length;
+              const totalRequired = required.length + (form.anonymous ? 0 : 1);
+              const nameDone = !form.anonymous && Boolean(respondent.name.trim());
+              const doneRequired = answeredRequired + (nameDone ? 1 : 0);
+              const pct = totalRequired
+                ? Math.round((doneRequired / totalRequired) * 100)
+                : 100;
+              const ready = doneRequired >= totalRequired;
+
+              return (
+                <div className="mb-6">
+                  <div
+                    className="flex items-center justify-between font-mono text-[11px] text-ink/50"
+                    role="status"
+                  >
+                    <span>
+                      {ready
+                        ? 'Ready to submit — everything required is answered'
+                        : `${doneRequired} of ${totalRequired} required answered`}
+                    </span>
+                    <span className={cn(ready && 'font-semibold text-tick')}>{pct}%</span>
+                  </div>
+                  <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-ink/[0.06]">
+                    <div
+                      className={cn(
+                        'h-full rounded-full transition-all duration-300',
+                        ready ? 'bg-tick' : 'bg-ballpoint-500'
+                      )}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
+
+          <div className="pt-7">
+              <FormRenderer
+                form={form}
+                values={values}
+                respondent={respondent}
+                errors={errors}
+                pendingFiles={pendingFiles}
+                onFileChange={(qid, file) => {
+                  setPendingFiles((prev) => {
+                    const next = { ...prev };
+                    if (file) next[qid] = file;
+                    else delete next[qid];
+                    return next;
+                  });
+                  setErrors((e) => {
+                    if (!(qid in e)) return e;
+                    const next = { ...e };
+                    delete next[qid];
+                    return next;
+                  });
+                }}
+                onChange={(qid, value) => {
+                  setValues((v) => ({ ...v, [qid]: value }));
+                  setErrors((e) => {
+                    if (!(qid in e)) return e;
+                    const next = { ...e };
+                    delete next[qid];
+                    return next;
+                  });
+                }}
+                onRespondentChange={(patch) => {
+                  setRespondent((r) => ({ ...r, ...patch }));
+                  setErrors((e) => {
+                    if (!('__respondent' in e) || !patch.name?.trim()) return e;
+                    const next = { ...e };
+                    delete next.__respondent;
+                    return next;
+                  });
+                }}
+              />
+            </div>
+
+            <div className="mt-8 border-t border-ink/[0.06] pt-6">
+              <Button
+                size="lg"
+                className={cn('w-full sm:w-auto', CATEGORY_ACCENT[form.category].button)}
+                onClick={handleSubmit}
+                disabled={submitting}
+              >
+                <Send />
+                {submitting ? 'Sending…' : 'Submit response'}
+              </Button>
+              <p className="mt-3 font-mono text-[11px] uppercase tracking-wider text-ink/40">
+                {isDemo
+                  ? 'Sample — nothing leaves this browser'
+                  : form.anonymous
+                    ? 'Anonymous — no name stored · Goes straight to the organizer’s dashboard'
+                    : 'Your name is attached to this response · Goes straight to the organizer’s dashboard'}
+              </p>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <SiteFooter />
+    </div>
+  );
+}
